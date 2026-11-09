@@ -346,26 +346,66 @@ load test_helper
   assert_failed "${HOME}/Code/My-Project/vendor"
 }
 
-@test "failed paths are skipped on subsequent runs" {
+@test "failed read-only paths are skipped on subsequent runs" {
   create_project "Code/Good-Project" "package.json" "node_modules"
   create_project "Code/Bad-Project" "go.mod" "vendor"
+  chmod 555 "${HOME}/Code/Bad-Project/vendor"
 
-  # First run: Bad-Project fails
-  ASIMOV_TEST_TMUTIL_FAIL_PATHS="$(mktemp)"
-  export ASIMOV_TEST_TMUTIL_FAIL_PATHS
-  echo "${HOME}/Code/Bad-Project/vendor" > "$ASIMOV_TEST_TMUTIL_FAIL_PATHS"
-
+  # First run: Bad-Project is read-only, so it fails
   run_asimov
   [[ "$status" -eq 0 ]]
   assert_excluded "${HOME}/Code/Good-Project/node_modules"
   refute_excluded "${HOME}/Code/Bad-Project/vendor"
   assert_failed "${HOME}/Code/Bad-Project/vendor"
 
-  # Second run: Bad-Project should be skipped entirely (not retried)
+  # Second run: Bad-Project is still read-only, so it's skipped without a retry
+  run_asimov
+  local status_copy="$status" output_copy="$output"
+  chmod 755 "${HOME}/Code/Bad-Project/vendor"
+  [[ "$status_copy" -eq 0 ]]
+  [[ "$output_copy" != *"read-only"* ]]
+  refute_excluded "${HOME}/Code/Bad-Project/vendor"
+  assert_failed "${HOME}/Code/Bad-Project/vendor"
+}
+
+@test "failed read-only path is retried once it becomes writable" {
+  create_project "Code/Go-Project" "go.mod" "vendor"
+  chmod 555 "${HOME}/Code/Go-Project/vendor"
+  run_asimov
+  assert_failed "${HOME}/Code/Go-Project/vendor"
+
+  # Recreated by the tool (or chmod u+w): writable now
+  chmod 755 "${HOME}/Code/Go-Project/vendor"
+
   run_asimov
   [[ "$status" -eq 0 ]]
-  # Should still not be excluded (was never successfully added)
-  refute_excluded "${HOME}/Code/Bad-Project/vendor"
+  assert_excluded "${HOME}/Code/Go-Project/vendor"
+  refute_failed "${HOME}/Code/Go-Project/vendor"
+}
+
+@test "path that failed with a tmutil error stays skipped on later runs" {
+  create_project "Code/My-Project" "package.json" "node_modules"
+  ASIMOV_TEST_TMUTIL_FAIL_PATHS="${TEST_TEMP_DIR}/.tmutil_fail_paths"
+  export ASIMOV_TEST_TMUTIL_FAIL_PATHS
+  echo "${HOME}/Code/My-Project/node_modules" > "$ASIMOV_TEST_TMUTIL_FAIL_PATHS"
+  run_asimov
+  assert_failed "${HOME}/Code/My-Project/node_modules"
+
+  log_tmutil_calls
+  run_asimov
+  [[ "$status" -eq 0 ]]
+  [[ "$output" != *"failed to exclude"* ]]
+  [[ -z "$(tmutil_calls addexclusion)" ]]
+  assert_failed "${HOME}/Code/My-Project/node_modules"
+}
+
+@test "failed-state entry whose directory is gone is dropped" {
+  mkdir -p "${HOME}/.cache/asimov"
+  printf '%s\n' "${HOME}/gone-a" "ro	${HOME}/gone-b" > "${HOME}/.cache/asimov/failed"
+
+  run_asimov
+  [[ "$status" -eq 0 ]]
+  [[ ! -s "${HOME}/.cache/asimov/failed" ]]
 }
 
 @test "--full-scan clears failed state and retries" {
@@ -407,6 +447,228 @@ load test_helper
   run_asimov "${HOME}/Code"
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"Using cached paths"* ]]
+}
+
+# =============================================================================
+# Excluded state (issue #139)
+#
+# ~/.cache/asimov/excluded lets a run skip paths it excluded before, even when
+# Spotlight doesn't report them. Each run re-verifies it with one batched
+# `tmutil isexcluded` call, so a directory that lost its exclusion is excluded
+# again.
+# =============================================================================
+
+@test "recreated dependency directory is excluded again" {
+  create_project "Code/My-Project" "package.json" "node_modules"
+  run_asimov
+  assert_excluded "${HOME}/Code/My-Project/node_modules"
+
+  recreate_dir "${HOME}/Code/My-Project/node_modules"
+
+  run_asimov
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"Using cached paths"* ]]
+  [[ "$output" == *"node_modules has been excluded"* ]]
+  assert_excluded "${HOME}/Code/My-Project/node_modules"
+}
+
+@test "recreated extra fixed directory is excluded again" {
+  mkdir -p "${HOME}/.custom-cache"
+  write_config "[fixed_dirs]
+extra = ~/.custom-cache"
+  run_asimov
+  assert_excluded "${HOME}/.custom-cache"
+
+  recreate_dir "${HOME}/.custom-cache"
+
+  run_asimov
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *".custom-cache has been excluded"* ]]
+  assert_excluded "${HOME}/.custom-cache"
+}
+
+@test "exclusion removed without recreating the directory is applied again" {
+  mkdir -p "${HOME}/.custom-cache"
+  write_config "[fixed_dirs]
+extra = ~/.custom-cache"
+  run_asimov
+  assert_excluded "${HOME}/.custom-cache"
+
+  # tmutil removeexclusion: the directory stays, its exclusion goes
+  : > "$ASIMOV_TEST_EXCLUSIONS"
+
+  run_asimov
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *".custom-cache has been excluded"* ]]
+  assert_excluded "${HOME}/.custom-cache"
+}
+
+@test "excluded state is verified with one batched isexcluded call" {
+  mkdir -p "${HOME}/.cache-a" "${HOME}/.cache-b" "${HOME}/.cache-c"
+  write_config "[fixed_dirs]
+extra = ~/.cache-a
+extra = ~/.cache-b
+extra = ~/.cache-c"
+  run_asimov
+  [[ "$(count_exclusions)" -eq 3 ]]
+
+  log_tmutil_calls
+  run_asimov --verbose
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"Excluded state verified: kept 3 of 3 entries"* ]]
+  [[ "$output" == *"3 paths already excluded, skipping."* ]]
+  [[ "$(tmutil_calls isexcluded | wc -l | tr -d ' ')" -eq 1 ]]
+  [[ "$(tmutil_calls isexcluded)" == *"${HOME}/.cache-a"*"${HOME}/.cache-b"*"${HOME}/.cache-c"* ]]
+  [[ -z "$(tmutil_calls addexclusion)" ]]
+}
+
+@test "excluded state is trusted as is when tmutil can't read exclusions" {
+  mkdir -p "${HOME}/.custom-cache"
+  write_config "[fixed_dirs]
+extra = ~/.custom-cache"
+  run_asimov
+  local before
+  before="$(read_excluded_state)"
+
+  log_tmutil_calls
+  ASIMOV_TEST_TMUTIL_ISEXCLUDED_FAIL=1 run_asimov --quiet
+  [[ "$status" -eq 0 ]]
+  # A warning on stderr, even under --quiet
+  [[ "$output" == *"Could not check ${HOME}/.cache/asimov/excluded"*"trusting it as is"* ]]
+  [[ -z "$(tmutil_calls addexclusion)" ]]
+  [[ "$(read_excluded_state)" == "$before" ]]
+}
+
+# A scheduled run can't read exclusions inside privacy-protected folders such as
+# ~/Documents: tmutil says [UNKNOWN] and addexclusion fails. What a terminal run
+# excluded there must stay trusted rather than be retried every run.
+@test "excluded-state entry tmutil reports as unknown is kept" {
+  create_project "Documents/My-Project" "package.json" "node_modules"
+  run_asimov
+  assert_excluded "${HOME}/Documents/My-Project/node_modules"
+
+  ASIMOV_TEST_TMUTIL_UNKNOWN_PATHS="${TEST_TEMP_DIR}/.tmutil_unknown_paths"
+  ASIMOV_TEST_TMUTIL_FAIL_PATHS="$ASIMOV_TEST_TMUTIL_UNKNOWN_PATHS"
+  export ASIMOV_TEST_TMUTIL_UNKNOWN_PATHS ASIMOV_TEST_TMUTIL_FAIL_PATHS
+  echo "${HOME}/Documents/My-Project/node_modules" > "$ASIMOV_TEST_TMUTIL_UNKNOWN_PATHS"
+
+  log_tmutil_calls
+  run_asimov
+  [[ "$status" -eq 0 ]]
+  [[ "$output" != *"failed to exclude"* ]]
+  [[ -z "$(tmutil_calls addexclusion)" ]]
+  [[ "$(read_excluded_state)" == "${HOME}/Documents/My-Project/node_modules" ]]
+  refute_failed "${HOME}/Documents/My-Project/node_modules"
+}
+
+@test "symlinked extra fixed directory stays on the fast path" {
+  mkdir -p "${HOME}/real-cache"
+  ln -s "${HOME}/real-cache" "${HOME}/.linked-cache"
+  write_config "[fixed_dirs]
+extra = ~/.linked-cache"
+  run_asimov
+  assert_excluded "${HOME}/.linked-cache"
+
+  log_tmutil_calls
+  run_asimov --verbose
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"Excluded state verified: kept 1 of 1 entries"* ]]
+  [[ -z "$(tmutil_calls addexclusion)" ]]
+}
+
+@test "excluded state is still verified when tmutil prints extra lines" {
+  mkdir -p "${HOME}/.custom-cache"
+  write_config "[fixed_dirs]
+extra = ~/.custom-cache"
+  run_asimov
+  recreate_dir "${HOME}/.custom-cache"
+
+  ASIMOV_TEST_TMUTIL_ISEXCLUDED_NOISE=1 run_asimov
+  [[ "$status" -eq 0 ]]
+  [[ "$output" != *"trusting it as is"* ]]
+  [[ "$output" == *".custom-cache has been excluded"* ]]
+}
+
+@test "deleted directory is dropped from the excluded state" {
+  mkdir -p "${HOME}/.cache-a" "${HOME}/.cache-b"
+  write_config "[fixed_dirs]
+extra = ~/.cache-a
+extra = ~/.cache-b"
+  run_asimov
+  rm -rf "${HOME}/.cache-b"
+
+  run_asimov
+  [[ "$status" -eq 0 ]]
+  [[ "$(read_excluded_state)" == "${HOME}/.cache-a" ]]
+}
+
+@test "excluded state handles paths with spaces" {
+  create_project "Code/My Project" "package.json" "node_modules"
+  run_asimov
+  assert_excluded "${HOME}/Code/My Project/node_modules"
+
+  log_tmutil_calls
+  run_asimov
+  [[ "$status" -eq 0 ]]
+  [[ -z "$(tmutil_calls addexclusion)" ]]
+  [[ "$(read_excluded_state)" == "${HOME}/Code/My Project/node_modules" ]]
+}
+
+@test "excluded state keeps one line per directory" {
+  mkdir -p "${HOME}/.custom-cache"
+  write_config "[fixed_dirs]
+extra = ~/.custom-cache"
+  run_asimov
+  [[ "$(read_excluded_state)" == "${HOME}/.custom-cache" ]]
+
+  recreate_dir "${HOME}/.custom-cache"
+  run_asimov
+  [[ "$(read_excluded_state)" == "${HOME}/.custom-cache" ]]
+
+  run_asimov
+  [[ "$status" -eq 0 ]]
+  [[ "$(read_excluded_state)" == "${HOME}/.custom-cache" ]]
+}
+
+@test "--dry-run and --no-write-cache leave the excluded state untouched" {
+  mkdir -p "${HOME}/.cache-a" "${HOME}/.cache-b"
+  write_config "[fixed_dirs]
+extra = ~/.cache-a
+extra = ~/.cache-b"
+  run_asimov
+  rm -rf "${HOME}/.cache-b"
+  recreate_dir "${HOME}/.cache-a"
+  local before
+  before="$(read_excluded_state)"
+
+  run_asimov --dry-run
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"Would exclude: ${HOME}/.cache-a"* ]]
+  [[ "$(read_excluded_state)" == "$before" ]]
+
+  run_asimov --no-write-cache
+  [[ "$status" -eq 0 ]]
+  assert_excluded "${HOME}/.cache-a"
+  [[ "$(read_excluded_state)" == "$before" ]]
+}
+
+# Spotlight is trusted as reported. Right after a directory is recreated it can
+# still list the old exclusion; once it catches up, the next run excludes it.
+@test "recreated directory still reported by Spotlight is excluded once Spotlight catches up" {
+  create_project "Code/My-Project" "package.json" "node_modules"
+  run_asimov
+  recreate_dir "${HOME}/Code/My-Project/node_modules"
+
+  ASIMOV_TEST_MDFIND_RESULTS="${TEST_TEMP_DIR}/.mdfind_results"
+  export ASIMOV_TEST_MDFIND_RESULTS
+  echo "${HOME}/Code/My-Project/node_modules" > "$ASIMOV_TEST_MDFIND_RESULTS"
+  run_asimov
+  refute_excluded "${HOME}/Code/My-Project/node_modules"
+
+  : > "$ASIMOV_TEST_MDFIND_RESULTS"
+  run_asimov
+  [[ "$status" -eq 0 ]]
+  assert_excluded "${HOME}/Code/My-Project/node_modules"
 }
 
 # =============================================================================

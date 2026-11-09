@@ -65,7 +65,10 @@ init_temp_files() {
     ASIMOV_SIZE_LOG="$(mktemp)"
     ASIMOV_EXCLUDED_CACHE="$(mktemp)"
     ASIMOV_PATH_CACHE_TMP=""
-    trap 'rm -f "$ASIMOV_SIZE_LOG" "$ASIMOV_EXCLUDED_CACHE" "$ASIMOV_PATH_CACHE_TMP"' EXIT
+    ASIMOV_STATE_TMP=""
+    ASIMOV_VERIFIED_TMP=""
+    trap 'rm -f "$ASIMOV_SIZE_LOG" "$ASIMOV_EXCLUDED_CACHE" "${ASIMOV_EXCLUDED_CACHE}.merged" \
+        "$ASIMOV_PATH_CACHE_TMP" "$ASIMOV_STATE_TMP" "$ASIMOV_VERIFIED_TMP"' EXIT
 }
 
 # Resolve ASIMOV_ROOT and every path derived from it.

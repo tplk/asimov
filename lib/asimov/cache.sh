@@ -56,6 +56,100 @@ append_state() {
     return 0
 }
 
+# Print the console user when running as root, so cache files a root run creates
+# can be handed back to them (issue #122). Fails when not running as root, or when
+# root is the console user.
+console_user_for_root_run() {
+    [[ "${EUID:-$(id -u)}" -eq 0 ]] || return 1
+    local console_user
+    console_user="$(stat -f '%Su' /dev/console 2>/dev/null || echo '')"
+    [[ -n "$console_user" && "$console_user" != "root" ]] || return 1
+    printf '%s\n' "$console_user"
+}
+
+# Replace a state file with the contents of stdin. The new contents go to a temp
+# file in the cache directory first and are moved into place, so an interrupted
+# run never leaves a half-written file, and an unchanged file isn't touched. After
+# a root run the file is handed back to the console user (issue #122).
+# Discards stdin under --dry-run / --no-write-cache, or when the file isn't
+# writable. Always returns 0.
+#
+# Two runs at once (a scheduled one and a manual one) can lose lines the other
+# appended in between. That costs the next run a re-check or a retry, never a
+# wrong skip.
+rewrite_state() {
+    local file="$1" console_user
+    if [[ -n "$ASIMOV_DRY_RUN" || -n "$ASIMOV_NO_WRITE_CACHE" ]] || ! cache_writable "$file"; then
+        cat > /dev/null
+        return 0
+    fi
+    ASIMOV_STATE_TMP="${file}.tmp.$$"
+    if { cat > "$ASIMOV_STATE_TMP"; } 2>/dev/null \
+        && ! cmp -s "$ASIMOV_STATE_TMP" "$file" \
+        && mv -f "$ASIMOV_STATE_TMP" "$file" 2>/dev/null; then
+        if console_user="$(console_user_for_root_run)"; then
+            chown "$console_user" "$file" 2>/dev/null || true
+        fi
+    fi
+    rm -f "$ASIMOV_STATE_TMP"
+    ASIMOV_STATE_TMP=""
+    return 0
+}
+
+# Print the excluded-state paths that Time Machine hasn't stopped excluding.
+# A directory that was deleted and recreated (`rm -rf node_modules && npm install`)
+# has lost its exclusion xattr, as has one whose exclusion was removed by hand, so
+# tmutil reports it [Included]; it drops out here and goes back through
+# exclude_paths_from_stdin (issue #139). [UNKNOWN] means tmutil couldn't read the
+# setting: the path is gone, or a scheduled run is kept out of a privacy-protected
+# folder such as ~/Documents. Only a gone path is dropped, so a scheduled run never
+# tries (and fails) to re-exclude what a terminal run excluded.
+#
+# All paths go to one batched `tmutil isexcluded` call: a few milliseconds per
+# path, against ~120ms for a call per path. tmutil prints one "[Status]  path"
+# line per argument, in order, with symlinks resolved, so lines are matched to
+# paths by position and checked with -ef. Returns 1 when the output doesn't line
+# up (e.g. tmutil can't read exclusions at all), so the caller can fall back.
+verified_excluded_state() {
+    local paths line path printed kept="" count=0 total
+    paths="$(grep -v '^$' "$ASIMOV_EXCLUDED_STATE" | sort -u || true)"
+    [[ -n "$paths" ]] || return 0
+    total="$(printf '%s\n' "$paths" | wc -l | tr -d ' ')"
+    while IFS= read -r line <&3; do
+        IFS= read -r path <&4 || return 1
+        count=$((count + 1))
+        printed="${line#*]}"
+        printed="${printed#"${printed%%[![:space:]]*}"}"
+        [[ "$printed" == "$path" || "$printed" -ef "$path" ]] || return 1
+        case "${line%%]*}" in
+            '[Included') continue ;;
+            '[UNKNOWN') [[ -e "$path" ]] || continue ;;
+        esac
+        kept+="${path}"$'\n'
+    done 3< <(printf '%s\n' "$paths" | tr '\n' '\0' \
+                | { xargs -0 tmutil isexcluded 2>/dev/null || true; } | { grep '^\[' || true; }) \
+         4< <(printf '%s\n' "$paths")
+    [[ "$count" -eq "$total" ]] || return 1
+    printf '%s' "$kept"
+}
+
+# Print the failed-state lines still worth honoring. A read-only directory
+# ("ro<TAB>path", see exclude_paths_from_stdin) is honored only while it is still
+# read-only: one that became writable, or was recreated, is retried. Any other
+# failure ("path") is honored while the path exists; use --no-read-cache to retry.
+honored_failed_state() {
+    local line path ro_prefix=$'ro\t'
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        path="${line#"$ro_prefix"}"
+        [[ -e "$path" ]] || continue
+        if [[ "$path" != "$line" ]] && [[ ! -d "$path" || -w "$path" ]]; then
+            continue
+        fi
+        printf '%s\n' "$line"
+    done < "$ASIMOV_FAILED_STATE"
+}
+
 # Create the cache directory, chown to console user when running as root.
 ensure_cache_dir() {
     if [[ ! -d "$ASIMOV_CACHE_DIR" ]]; then
@@ -64,19 +158,16 @@ ensure_cache_dir() {
             return 0
         }
     fi
-    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-        local console_user
-        console_user="$(stat -f '%Su' /dev/console 2>/dev/null || echo '')"
-        if [[ -n "$console_user" && "$console_user" != "root" ]]; then
-            # Create the state files *before* the chown. Appending to an existing
-            # file never changes its owner, so every write later in this root run
-            # lands in a file the console user can still read next time. Chowning
-            # only the directory (as this did before) left root-owned files behind
-            # that broke the following user run outright — issue #122.
-            touch "$ASIMOV_EXCLUDED_STATE" "$ASIMOV_FAILED_STATE" \
-                  "$ASIMOV_MDFIND_SEEN" "$ASIMOV_PATH_CACHE" 2>/dev/null || true
-            chown -R "$console_user" "$ASIMOV_CACHE_DIR" 2>/dev/null || true
-        fi
+    local console_user
+    if console_user="$(console_user_for_root_run)"; then
+        # Create the state files *before* the chown. Appending to an existing
+        # file never changes its owner, so every write later in this root run
+        # lands in a file the console user can still read next time. Chowning
+        # only the directory (as this did before) left root-owned files behind
+        # that broke the following user run outright — issue #122.
+        touch "$ASIMOV_EXCLUDED_STATE" "$ASIMOV_FAILED_STATE" \
+              "$ASIMOV_MDFIND_SEEN" "$ASIMOV_PATH_CACHE" 2>/dev/null || true
+        chown -R "$console_user" "$ASIMOV_CACHE_DIR" 2>/dev/null || true
     fi
     return 0
 }
@@ -155,24 +246,15 @@ finalize_path_cache() {
     mv -f "$ASIMOV_PATH_CACHE_TMP" "$ASIMOV_PATH_CACHE"
     ASIMOV_PATH_CACHE_TMP=""
 
-    # Dedup the mdfind_seen file (grows with appends each run)
-    if cache_readable "$ASIMOV_MDFIND_SEEN" && cache_writable "$ASIMOV_MDFIND_SEEN"; then
-        sort -u "$ASIMOV_MDFIND_SEEN" > "${ASIMOV_MDFIND_SEEN}.tmp"
-        mv -f "${ASIMOV_MDFIND_SEEN}.tmp" "$ASIMOV_MDFIND_SEEN"
+    # Dedup the mdfind_seen file (grows with appends each run). The excluded and
+    # failed state are compacted by build_excluded_cache instead.
+    if cache_readable "$ASIMOV_MDFIND_SEEN"; then
+        sort -u "$ASIMOV_MDFIND_SEEN" | rewrite_state "$ASIMOV_MDFIND_SEEN"
     fi
 
-    # Dedup the failed-state file (grows with appends each run)
-    if cache_readable "$ASIMOV_FAILED_STATE" && cache_writable "$ASIMOV_FAILED_STATE"; then
-        sort -u "$ASIMOV_FAILED_STATE" > "${ASIMOV_FAILED_STATE}.tmp"
-        mv -f "${ASIMOV_FAILED_STATE}.tmp" "$ASIMOV_FAILED_STATE"
-    fi
-
-    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-        local console_user
-        console_user="$(stat -f '%Su' /dev/console 2>/dev/null || echo '')"
-        if [[ -n "$console_user" && "$console_user" != "root" ]]; then
-            chown "$console_user" "$ASIMOV_PATH_CACHE" 2>/dev/null || true
-        fi
+    local console_user
+    if console_user="$(console_user_for_root_run)"; then
+        chown "$console_user" "$ASIMOV_PATH_CACHE" 2>/dev/null || true
     fi
 }
 
@@ -210,6 +292,7 @@ prune_path_cache() {
 # The persistent state covers:
 #   - Interrupted runs (Ctrl+C before all tmutil calls complete)
 #   - Spotlight indexing delays (tmutil set the xattr but Spotlight hasn't indexed it)
+#   - Directories Spotlight never reports, such as ~/.cache and other dot-dirs
 build_excluded_cache() {
     verbose_timing "Building excluded-path cache via Spotlight…"
     : > "$ASIMOV_EXCLUDED_CACHE"
@@ -222,17 +305,43 @@ build_excluded_cache() {
     sort -u -o "$ASIMOV_EXCLUDED_CACHE" "$ASIMOV_EXCLUDED_CACHE"
     spotlight_count="$(wc -l < "$ASIMOV_EXCLUDED_CACHE" | tr -d ' ')"
 
-    # Failed paths (e.g. read-only dirs inside Go's module cache) are merged in too,
-    # so the bulk filter skips them instantly instead of wasting time retrying tmutil.
+    # Merge in Asimov's own state, keeping only the entries that still hold, and
+    # compact each file to them:
+    #   - excluded: what Time Machine hasn't stopped excluding (see
+    #     verified_excluded_state). When tmutil can't answer, the state is trusted
+    #     as is rather than sending every entry to a ~11s addexclusion.
+    #   - failed: see honored_failed_state, so the bulk filter skips these
+    #     instantly instead of retrying tmutil.
     # Skipped under --no-read-cache (--full-scan / --no-cache): every path is then
     # re-verified against the tmutil isexcluded ground truth instead.
     if [[ -z "$ASIMOV_NO_READ_CACHE" ]] && { cache_readable "$ASIMOV_EXCLUDED_STATE" || cache_readable "$ASIMOV_FAILED_STATE"; }; then
-        {
-            cat "$ASIMOV_EXCLUDED_CACHE"
-            if cache_readable "$ASIMOV_EXCLUDED_STATE"; then cat "$ASIMOV_EXCLUDED_STATE"; fi
-            if cache_readable "$ASIMOV_FAILED_STATE"; then cat "$ASIMOV_FAILED_STATE"; fi
-        } | sort -u > "${ASIMOV_EXCLUDED_CACHE}.merged"
+        ASIMOV_VERIFIED_TMP="$(mktemp)"
+        if cache_readable "$ASIMOV_EXCLUDED_STATE"; then
+            local state_count
+            state_count="$(grep -v '^$' "$ASIMOV_EXCLUDED_STATE" | sort -u | wc -l | tr -d ' ' || true)"
+            if verified_excluded_state > "$ASIMOV_VERIFIED_TMP"; then
+                verbose_timing "Excluded state verified: kept $(wc -l < "$ASIMOV_VERIFIED_TMP" | tr -d ' ') of ${state_count} entries"
+                rewrite_state "$ASIMOV_EXCLUDED_STATE" < "$ASIMOV_VERIFIED_TMP"
+            else
+                # Always on stderr, like warn_unusable_cache: without the check, a
+                # recreated directory stays included (issue #139).
+                printf '! Could not check %s with tmutil isexcluded — trusting it as is.\n' \
+                    "$ASIMOV_EXCLUDED_STATE" >&2
+                sort -u "$ASIMOV_EXCLUDED_STATE" > "$ASIMOV_VERIFIED_TMP"
+            fi
+        fi
+        if cache_readable "$ASIMOV_FAILED_STATE"; then
+            local failed_lines
+            failed_lines="$(honored_failed_state | sort -u)"
+            printf '%s' "${failed_lines:+${failed_lines}$'\n'}" | rewrite_state "$ASIMOV_FAILED_STATE"
+            if [[ -n "$failed_lines" ]]; then
+                printf '%s\n' "$failed_lines" | sed "s/^ro$(printf '\t')//" >> "$ASIMOV_VERIFIED_TMP"
+            fi
+        fi
+        sort -u "$ASIMOV_EXCLUDED_CACHE" "$ASIMOV_VERIFIED_TMP" > "${ASIMOV_EXCLUDED_CACHE}.merged"
         mv -f "${ASIMOV_EXCLUDED_CACHE}.merged" "$ASIMOV_EXCLUDED_CACHE"
+        rm -f "$ASIMOV_VERIFIED_TMP"
+        ASIMOV_VERIFIED_TMP=""
     fi
     verbose_timing "Excluded-path cache ready ($(wc -l < "$ASIMOV_EXCLUDED_CACHE" | tr -d ' ') entries, ${spotlight_count} from Spotlight)"
 }

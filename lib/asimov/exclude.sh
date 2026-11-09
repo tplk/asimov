@@ -34,7 +34,9 @@ record_excluded_path() {
 # - Spotlight (mdfind) can be stale: recently excluded paths may not appear in the index.
 #   Without a guard, this causes re-excluding already-done paths (~11s each, wasted).
 # - Three-layer defense against wasted tmutil calls:
-#   1. Bulk grep against Spotlight + persistent state (instant, catches ~90%)
+#   1. Bulk grep against Spotlight + persistent state (instant, catches ~90%).
+#      The excluded state is re-verified once per run by build_excluded_cache,
+#      with one batched tmutil isexcluded call.
 #   2. Filter descendants of fixed dirs (instant, catches ~5%)
 #   3. tmutil isexcluded per-path guard (fast, catches remaining stale entries)
 exclude_paths_from_stdin() {
@@ -145,7 +147,9 @@ exclude_paths_from_stdin() {
         # deliberately 0555. Check first: addexclusion costs ~11s even when it fails.
         if [[ ! -w "$path" ]]; then
             echo "! ${path}: read-only, cannot be excluded — skipping." >&2
-            [[ -z "$ASIMOV_NO_WRITE_CACHE" ]] && append_state "$path" "$ASIMOV_FAILED_STATE"
+            # Tagged "ro" so later runs retry it once it is writable again
+            # (honored_failed_state).
+            [[ -z "$ASIMOV_NO_WRITE_CACHE" ]] && append_state "ro"$'\t'"$path" "$ASIMOV_FAILED_STATE"
             continue
         fi
         # tmutil prints its POSIXError dump to stdout, not stderr — silence both.

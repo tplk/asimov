@@ -88,6 +88,38 @@ refute_excluded() {
   fi
 }
 
+# Delete a directory and create it again, as `rm -rf node_modules && npm install`
+# does. Time Machine stores an exclusion as an xattr on the directory itself, so
+# the new directory is no longer excluded; drop it from the mock's database too.
+#
+# Usage: recreate_dir <path>
+recreate_dir() {
+  local path="$1"
+  rm -rf "$path"
+  mkdir -p "$path"
+  { grep -Fxv "$path" "$ASIMOV_TEST_EXCLUSIONS" || true; } > "${ASIMOV_TEST_EXCLUSIONS}.tmp"
+  mv -f "${ASIMOV_TEST_EXCLUSIONS}.tmp" "$ASIMOV_TEST_EXCLUSIONS"
+}
+
+# Log every mock tmutil call from here on, one line per call (see tests/bin/tmutil).
+log_tmutil_calls() {
+  ASIMOV_TEST_TMUTIL_LOG="${TEST_TEMP_DIR}/.tmutil_log"
+  export ASIMOV_TEST_TMUTIL_LOG
+  : > "$ASIMOV_TEST_TMUTIL_LOG"
+}
+
+# Print the logged mock tmutil calls for one subcommand.
+#
+# Usage: tmutil_calls isexcluded
+tmutil_calls() {
+  grep "^$1\( \|$\)" "$ASIMOV_TEST_TMUTIL_LOG" || true
+}
+
+# Print the excluded-path state file.
+read_excluded_state() {
+  cat "${HOME}/.cache/asimov/excluded"
+}
+
 # Write a config file for testing.
 #
 # Usage: write_config "config file contents"
@@ -169,7 +201,7 @@ assert_failed() {
         echo "Expected failed state file to exist, but it does not." >&2
         return 1
     fi
-    if ! grep -Fxq "$path" "$failed_file"; then
+    if ! grep -Fxq -e "$path" -e "ro	${path}" "$failed_file"; then
         echo "Expected '$path' to be in failed state, but it was not." >&2
         echo "Failed state contents:" >&2
         cat "$failed_file" >&2
@@ -182,7 +214,7 @@ refute_failed() {
     local path="$1"
     local failed_file="${HOME}/.cache/asimov/failed"
     [[ -f "$failed_file" ]] || return 0
-    if grep -Fxq "$path" "$failed_file"; then
+    if grep -Fxq -e "$path" -e "ro	${path}" "$failed_file"; then
         echo "Expected '$path' to NOT be in failed state, but it was." >&2
         echo "Failed state contents:" >&2
         cat "$failed_file" >&2
